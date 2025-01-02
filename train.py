@@ -1,267 +1,167 @@
 import torch
+from joblib import dump, load
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+import time
+import torch.utils.data as Data
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import matplotlib
+from sklearn.manifold import TSNE  # 导入t-SNE
 import numpy as np
-from sklearn.model_selection import train_test_split
-from adabelief_pytorch import AdaBelief
-import pandas as pd
+
+matplotlib.rc("font", family='Microsoft YaHei')
+
+torch.manual_seed(100)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # 有GPU先用GPU训练
+
+from model import CNNBiLSTMCrossAttModel
 
 
-csv_file = 'all_features.csv'  # 请根据实际情况修改文件路径
+def dataloader(batch_size, workers=2):
+    train_xdata = load('train_features_1024_10c')
+    train_ylabel = load('trainY_1024_10c')
+    val_xdata = load('val_features_1024_10c')
+    val_ylabel = load('valY_1024_10c')
+    test_xdata = load('test_features_1024_10c')
+    test_ylabel = load('testY_1024_10c')
 
-# 使用pandas加载CSV文件
-data_df = pd.read_csv(csv_file)
-
-# 假设最后一列是标签，其余列是特征
-X = data_df.iloc[:, :-1].values  # 获取所有特征列
-y = data_df.iloc[:, -1].values   # 获取标签列
-data = np.random.rand(119808, 10)  # 119808个样本，每个样本10个特征
-labels = np.random.randint(0, 2, 119808)  # 二分类标签示例
-
-# 训练集与测试集划分
-X_train, X_test, y_train, y_test = train_test_split(data, labels, test_size=0.2, random_state=42)
-
-# 转换为PyTorch张量
-X_train = torch.tensor(X_train, dtype=torch.float32)
-y_train = torch.tensor(y_train, dtype=torch.long)
-X_test = torch.tensor(X_test, dtype=torch.float32)
-y_test = torch.tensor(y_test, dtype=torch.long)
-
-# 创建DataLoader
-train_data = TensorDataset(X_train, y_train)
-test_data = TensorDataset(X_test, y_test)
-train_loader = DataLoader(train_data, batch_size=64, shuffle=True)
-test_loader = DataLoader(test_data, batch_size=64, shuffle=False)
-
-class DualSEBlock(nn.Module):
-    def __init__(self, channel, reduction=16):
-        super(DualSEBlock, self).__init__()
-        # 第一个通道：标准 SE 注意力机制
-        self.fc1_se = nn.Linear(channel, channel // reduction, bias=False)
-        self.fc2_se = nn.Linear(channel // reduction, channel, bias=False)
-
-        # 第二个通道：改进的双通道 SE 注意力机制
-        self.fc1_dual = nn.Linear(channel, channel // reduction, bias=False)
-        self.fc2_dual = nn.Linear(channel // reduction, channel // 2, bias=False)
-        self.fc3_dual = nn.Linear(channel // 2, channel, bias=False)
-
-        self.relu = nn.ReLU(inplace=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        b, c, _ = x.size()
-
-        # 第一个通道（SE）
-        y_se = torch.mean(x, dim=2)  # (B, C)
-        y_se = self.fc1_se(y_se)           # (B, C//reduction)
-        y_se = self.relu(y_se)
-        y_se = self.fc2_se(y_se)           # (B, C)
-        y_se = self.sigmoid(y_se).unsqueeze(2)  # (B, C, 1)
-
-        # 第二个通道（双通道 SE）
-        y_dual = torch.mean(x, dim=2)  # (B, C)
-        y_dual = self.fc1_dual(y_dual)  # (B, C//reduction)
-        y_dual = self.relu(y_dual)
-        y_dual = self.fc2_dual(y_dual)  # (B, C//2)
-        y_dual = self.relu(y_dual)
-        y_dual = self.fc3_dual(y_dual)  # (B, C)
-        y_dual = self.sigmoid(y_dual).unsqueeze(2)  # (B, C, 1)
-
-        # 两个通道的加权结果
-        out_se = x * y_se
-        out_dual = x * y_dual
-        return out_se + out_dual  # 非对称加权
+    train_loader = Data.DataLoader(dataset=Data.TensorDataset(train_xdata, train_ylabel),
+                                   batch_size=batch_size, shuffle=True, num_workers=workers, drop_last=True)
+    val_loader = Data.DataLoader(dataset=Data.TensorDataset(val_xdata, val_ylabel),
+                                 batch_size=batch_size, shuffle=True, num_workers=workers, drop_last=True)
+    test_loader = Data.DataLoader(dataset=Data.TensorDataset(test_xdata, test_ylabel),
+                                  batch_size=batch_size, shuffle=True, num_workers=workers, drop_last=True)
+    return train_loader, val_loader, test_loader
 
 
-# 更新 BasicBlock 以使用 DualSEBlock
-class BasicBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, se_reduction=16):
-        super(BasicBlock, self).__init__()
-        self.bn1 = nn.BatchNorm1d(in_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
+import torch
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-        # 使用 DualSEBlock 代替原 SEBlock
-        self.se_block = DualSEBlock(out_channels, se_reduction)
+def model_train(train_loader, test_loader, model, parameter):
+ 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    batch_size = parameter['batch_size']
+    epochs = parameter['epochs']
+    learn_rate = parameter['learn_rate']
+    loss_function = nn.CrossEntropyLoss(reduction='sum')  # loss
+    optimizer = torch.optim.Adam(model.parameters(), learn_rate) 
 
-        # 如果输入通道数与输出通道数不一致，使用卷积调整残差通道数
-        if in_channels != out_channels:
-            self.residual_conv = nn.Conv1d(in_channels, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        residual = x
-        x = self.bn1(x)
-        x = self.relu(x)
-        out = self.conv1(x)
-
-        out = self.bn2(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-
-        # 使用 DualSEBlock 进行通道加权
-        out = self.se_block(out)
-
-        # 如果输入和输出通道数不同，调整残差的通道数
-        if hasattr(self, 'residual_conv'):
-            residual = self.residual_conv(residual)
-
-        out += residual
-        return out
-
-# 定义ResNet模型 (加入SENet模块)
-class ResNet(nn.Module):
-    def __init__(self, input_channels, num_classes, se_reduction=16):
-        super(ResNet, self).__init__()
-        # 输入层：卷积操作，之后是批标准化和ReLU激活
-        self.conv1 = nn.Conv1d(input_channels, 64, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.layer1 = BasicBlock(64, 64, se_reduction)
-        self.layer2 = BasicBlock(64, 128, se_reduction)
-        self.layer3 = BasicBlock(128, 256, se_reduction)
-        self.fc_resnet = nn.Linear(256, 256)  # 作为 ResNet 到 GRU 的过渡
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = x.mean(dim=2)
-        x = self.fc_resnet(x)
-        return x
+    train_size = len(train_loader) * batch_size
+    val_size = len(val_loader) * batch_size
 
 
-class BiGRU(nn.Module):
-    def __init__(self, input_size, hidden_size, num_classes):
-        super(BiGRU, self).__init__()
-        self.gru = nn.GRU(input_size, hidden_size, bidirectional=True, batch_first=True)
-        self.fc = nn.Linear(hidden_size * 2, num_classes)
+    best_accuracy = 0.0
+    best_model = model
 
-    def forward(self, x):
-        x, _ = self.gru(x)
-        x = x[:, -1, :]
-        x = self.fc(x)
-        return x
+    train_loss = [] 
+    train_acc = []  
+    validate_acc = []
+    validate_loss = []
 
+    print('*' * 20, '开始训练', '*' * 20)
+    start_time = time.time()
+    for epoch in range(epochs):
+        model.train()
 
+        loss_epoch = 0.  
+        correct_epoch = 0  
+        for seq, labels in train_loader:
+            seq, labels = seq.to(device), labels.to(device)
+          
+            optimizer.zero_grad()
+           
+            y_pred = model(seq)  # torch.Size([16, 10])
+           
+            probabilities = F.softmax(y_pred, dim=1)
+            predicted_labels = torch.argmax(probabilities, dim=1)
+            correct_epoch += (predicted_labels == labels).sum().item()
+            loss = loss_function(y_pred, labels)
+            loss_epoch += loss.item()
+            loss.backward()
+            optimizer.step()
 
-class CrossAttention(nn.Module):
-    def __init__(self, query_size, key_size, value_size, hidden_size):
-        super(CrossAttention, self).__init__()
-        self.query_projection = nn.Linear(query_size, hidden_size)
-        self.key_projection = nn.Linear(key_size, hidden_size)
-        self.value_projection = nn.Linear(value_size, hidden_size)
-        self.attn = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=1, batch_first=True)
-        self.fc = nn.Linear(hidden_size, 256)
+        train_Accuracy = correct_epoch / train_size
+        train_loss.append(loss_epoch / train_size)
+        train_acc.append(train_Accuracy)
+        print(f'Epoch: {epoch + 1:2} train_Loss: {loss_epoch / train_size:10.8f} train_Accuracy:{train_Accuracy:4.4f}')
+        with torch.no_grad():
+            loss_validate = 0.
+            correct_validate = 0
+            for data, label in val_loader:
+                data, label = data.to(device), label.to(device)
+                pre = model(data)
+  
+                probabilities = F.softmax(pre, dim=1)
+                predicted_labels = torch.argmax(probabilities, dim=1)
+                correct_validate += (predicted_labels == label).sum().item()
+                loss = loss_function(pre, label)
+                loss_validate += loss.item()
+            val_accuracy = correct_validate / val_size
+            print(f'Epoch: {epoch + 1:2} val_Loss:{loss_validate / val_size:10.8f},  validate_Acc:{val_accuracy:4.4f}')
+            validate_loss.append(loss_validate / val_size)
+            validate_acc.append(val_accuracy)
+            if val_accuracy > best_accuracy:
+                best_accuracy = val_accuracy
+                best_model = model 
 
-    def forward(self, query, key, value):
-        query = self.query_projection(query)
-        key = self.key_projection(key)
-        value = self.value_projection(value)
+    last_model = model
+    print('*' * 20, '训练结束', '*' * 20)
+    print(f'\nDuration: {time.time() - start_time:.0f} seconds')
+    print("best_accuracy :", best_accuracy)
 
-        # Cross Attention Mechanism
-        attn_output, _ = self.attn(query, key, value)
+    plt.plot(range(epochs), train_loss, color='b', label='train_loss')
+    plt.plot(range(epochs), train_acc, color='g', label='train_acc')
+    plt.plot(range(epochs), validate_loss, color='y', label='validate_loss')
+    plt.plot(range(epochs), validate_acc, color='r', label='validate_acc')
+    plt.legend()
+    plt.savefig('train_result', dpi=100)
 
-        return self.fc(attn_output)
+    return last_model, best_model
 
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.manifold import TSNE
+from sklearn.metrics import confusion_matrix
+import torch.nn.functional as F
 
-# 定义整体模型（ResNet + CrossAttention + BiGRU + SENet）
-class ResNetBiGRUWithAttention(nn.Module):
-    def __init__(self, input_channels, num_classes, gru_hidden_size, se_reduction=16, attention_hidden_size=128):
-        super(ResNetBiGRUWithAttention, self).__init__()
-        self.resnet = ResNet(input_channels, num_classes, se_reduction)
-        self.cross_attention = CrossAttention(query_size=256, key_size=256, value_size=256, hidden_size=attention_hidden_size)
-        self.bigru = BiGRU(input_size=256, hidden_size=gru_hidden_size, num_classes=num_classes)
+def plot_tsne(model, train_loader, device):
+    model.eval()  
+    features, labels = [], []
 
-    def forward(self, x):
-        resnet_features = self.resnet(x)  # 获取 ResNet 特征
-        resnet_features = resnet_features.unsqueeze(1)  # 增加时间维度，使其适配GRU的输入形状
-
-        # 通过CrossAttention融合特征
-        attention_output = self.cross_attention(resnet_features, resnet_features, resnet_features)
-
-        # 传递给 BiGRU
-        output = self.bigru(attention_output)
-        return output
-
-
-# 初始化模型，定义损失函数和优化器
-model = ResNetBiGRUWithAttention(input_channels=10, num_classes=2, gru_hidden_size=128, se_reduction=16)  # 假设是二分类任务
-criterion = nn.CrossEntropyLoss()
-
-# 使用AdaBelief优化器
-optimizer = AdaBelief(model.parameters(), lr=0.00001, betas=(0.9, 0.999), eps=1e-16, weight_decouple=True)
-# 定义保存模型路径
-last_model_path = "last_model.pth"
-best_model_path = "best_model.pth"
-
-# 初始化变量来跟踪最佳准确率
-best_accuracy = 0.0
-
-# 训练模型
-num_epochs = 10
-for epoch in range(num_epochs):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-
-    for inputs, labels in train_loader:
-        # 调整输入的形状
-        inputs = inputs.unsqueeze(2)  # 适配Conv1d输入形状 (batch_size, channels, sequence_length)
-
-        optimizer.zero_grad()
-
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        running_loss += loss.item()
-        _, predicted = torch.max(outputs, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-
-    train_loss = running_loss / len(train_loader)
-    train_acc = 100 * correct / total
-    print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {train_loss:.4f}, Accuracy: {train_acc:.2f}%")
-
-    # 评估模型
-    model.eval()
-    correct = 0
-    total = 0
     with torch.no_grad():
-        for inputs, labels in test_loader:
-            inputs = inputs.unsqueeze(2)  # 使得形状为 (batch_size, 10, 1)
-            outputs = model(inputs)
-            _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+        for seq, label in train_loader:
+            seq = seq.to(device)
+            feature = model(seq) 
+            features.append(feature.cpu().numpy()) 
+            labels.append(label.cpu().numpy())  
 
-    test_acc = 100 * correct / total
-    print(f"Test Accuracy: {test_acc:.2f}%")
+    features = np.concatenate(features, axis=0)  
+    labels = np.concatenate(labels, axis=0)  
 
-    # 保存最后一个模型
-    torch.save(model.state_dict(), last_model_path)
+    tsne = TSNE(n_components=2, random_state=0)
+    reduced_features = tsne.fit_transform(features)
 
-    # 如果当前测试准确率更高，保存为最佳模型
-    if test_acc > best_accuracy:
-        best_accuracy = test_acc
-        torch.save(model.state_dict(), best_model_path)
-        print(f"New best model saved with accuracy: {best_accuracy:.2f}%")
+    plt.figure(figsize=(10, 8))
+    scatter = plt.scatter(reduced_features[:, 0], reduced_features[:, 1], c=labels, cmap='jet', alpha=0.6)
+    plt.colorbar(scatter)
+    num_classes = 10  
+    class_labels = ['normal'] + [f'fault{i}' for i in range(1, num_classes)]
+    handles, _ = scatter.legend_elements()
+    plt.legend(handles, class_labels, loc='upper center', bbox_to_anchor=(0.5, -0.1), ncol=5, fontsize=14,
+               frameon=False)
 
-print(f"Final Best Test Accuracy: {best_accuracy:.2f}%")
-
-
-
-
-
-
-
+    plt.title('t-SNE Visualization', fontsize=16)
+    plt.tick_params(axis='both', labelsize=12)
+    plt.savefig('tsne_result.png', dpi=300, bbox_inches='tight')
+    plt.show()
 
 
